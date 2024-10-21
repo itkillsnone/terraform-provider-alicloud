@@ -186,6 +186,25 @@ func resourceAlicloudClickHouseDbCluster() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+			"cold_storage_supported": {
+				Type:     schema.TypeBool,
+				Computed: true,
+			},
+			"cold_storage_status": {
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+					if v, ok := d.GetOk("cold_storage_supported"); ok {
+						return !v.(bool)
+					}
+					return false
+				},
+			},
+			"cold_storage_usage": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 		},
 	}
 }
@@ -408,6 +427,15 @@ func resourceAlicloudClickHouseDbClusterRead(d *schema.ResourceData, meta interf
 			d.Set("db_cluster_access_white_list", dBClusterAccessWhiteListMaps)
 		}
 	}
+
+	describeDBClusterColdStorageObject, err := clickhouseService.DescribeDBClusterColdStorage(d.Id(),client.RegionId)
+	if err != nil {
+		log.Printf("[DEBUG] Resource alicloud_click_house_db_cluster clickhouseService.DescribeDBClusterColdStorage Failed!!! %s", err)
+		return WrapError(err)
+	}
+	d.Set("cold_storage_supported",describeDBClusterColdStorageObject["ColdStorage"].(bool))
+	d.Set("cold_storage_usage",describeDBClusterColdStorageObject["StorageUsage"])
+	d.Set("cold_storage_status",describeDBClusterColdStorageObject["State"])
 
 	return nil
 }
@@ -705,6 +733,46 @@ func resourceAlicloudClickHouseDbClusterUpdate(d *schema.ResourceData, meta inte
 			}
 			d.SetPartial("renewal_status")
 		}
+	}
+	if !d.IsNewResource() && d.HasChange("cold_storage_status") {
+		enableColdStorage := d.Get("cold_storage_status") == "ENABLE"
+		if ! enableColdStorage {
+			return WrapError(fmt.Errorf("disabling cold storage is not supported"))
+		}
+		action := "CreateOSSStorage"
+		request := map[string]interface{}{
+			"DBClusterId":       d.Id(),
+			"RegionId":          client.RegionId,
+		}
+		
+		var response map[string]interface{}
+		conn, err := client.NewClickhouseClient()
+		if err != nil {
+			return WrapError(err)
+		}
+		wait := incrementalWait(3*time.Second, 3*time.Second)
+		err = resource.Retry(d.Timeout(schema.TimeoutUpdate), func() *resource.RetryError {
+			response, err = conn.DoRequest(StringPointer(action), nil, StringPointer("POST"), StringPointer("2019-11-11"), StringPointer("AK"), nil, request, &util.RuntimeOptions{})
+			if err != nil {
+				if IsExpectedErrors(err, []string{"IncorrectDBInstanceState"}) || NeedRetry(err) {
+					wait()
+					return resource.RetryableError(err)
+				}
+				return resource.NonRetryableError(err)
+			}
+			return nil
+		})
+		addDebug(action, response, request)
+		if err != nil {
+			return WrapErrorf(err, DefaultErrorMsg, d.Id(), action, AlibabaCloudSdkGoERROR)
+		}
+		clickhouseService := ClickhouseService{client}
+		stateConf := BuildStateConf([]string{"CREATING"}, []string{"DISABLE", "ENABLE"}, d.Timeout(schema.TimeoutUpdate), 5*time.Second, clickhouseService.ClickHouseColdStorageStatusRefreshFunc(d.Id(), client.RegionId, []string{}))
+		if _, err := stateConf.WaitForState(); err != nil {
+			return WrapErrorf(err, IdMsg, d.Id())
+		}
+		d.SetPartial("cold_storage_status")
+
 	}
 
 	d.Partial(false)
